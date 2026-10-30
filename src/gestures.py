@@ -12,6 +12,7 @@ import tkinter as tk
 # Cargar clasificadores clásicos usando la ruta interna nativa de OpenCV
 face_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_frontalface_default.xml')
 eye_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_eye.xml')
+smile_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_smile.xml')
 
 # Variables de control para evitar clics múltiples descontrolados
 contador_ojo_izq = 0
@@ -28,6 +29,11 @@ boca_estaba_abierta = False
 frames_desde_ultima_apertura = 0
 UMBRAL_VENTANA_DOBLE = 45  # Fotogramas máximos permitidos entre la 1ª y la 2ª apertura
 MARCA_BOCA_ABIERTA = 2200   # Umbral de píxeles oscuros para considerar la boca abierta
+
+# Variables de control para el Modo Emoji (Sonrisa -> Panel Windows + .)
+contador_sonrisa = 0
+UMBRAL_SONRISA_FRAMES = 12  # Fotogramas consecutivos de sonrisa para confirmar
+emoji_bloqueado = False     # Mecanismo de un solo uso hasta relajar la cara
 
 
 def mostrar_efecto_clic(x, y, tipo="left"):
@@ -103,6 +109,7 @@ def procesar_gestos(frame):
     """
     global contador_ojo_izq, contador_ojo_der, contador_edge_scroll
     global contador_aperturas_boca, boca_estaba_abierta, frames_desde_ultima_apertura
+    global contador_sonrisa, emoji_bloqueado
 
     # Aplicar efecto espejo para corregir la inversión de la cámara
     frame = cv2.flip(frame, 1)
@@ -323,5 +330,38 @@ def procesar_gestos(frame):
                 
         # Actualizar el estado anterior de la boca
         boca_estaba_abierta = boca_actualmente_abierta
+
+
+
+        # --- 5. MODO EMOJI: ABRIR PANEL DE WINDOWS CON UNA SONRISA ---
+        # Analizar la mitad inferior de la cara para detectar la sonrisa
+        roi_gray_cara_inferior = gray[y + int(h*0.5):y + h, x:x + w]
+        roi_color_cara_inferior = frame[y + int(h*0.5):y + h, x:x + w]
+        
+        smiles = smile_cascade.detectMultiScale(roi_gray_cara_inferior, scaleFactor=1.7, minNeighbors=22, minSize=(30, 30))
+        
+        if len(smiles) > 0:
+            if not emoji_bloqueado:
+                contador_sonrisa += 1
+                cv2.putText(frame, f"Cargando Panel Emojis ({contador_sonrisa}/{UMBRAL_SONRISA_FRAMES})", (50, 210), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                
+                if contador_sonrisa >= UMBRAL_SONRISA_FRAMES:
+                    # ¡Sonrisa confirmada! Pulsar simultáneamente Windows + .
+                    try:
+                        pyautogui.hotkey('win', '.')
+                    except Exception:
+                        pass
+                    
+                    cv2.putText(frame, "¡PANEL DE EMOJIS ACTIVADO!", (50, 250), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    
+                    # Bloquear para que no se abra en bucle hasta que dejes de sonreír
+                    emoji_bloqueado = True
+                    contador_sonrisa = 0
+        else:
+            # Si el usuario relaja la cara, reseteamos el bloqueo para futuras aperturas
+            contador_sonrisa = 0
+            emoji_bloqueado = False
 
     return frame
