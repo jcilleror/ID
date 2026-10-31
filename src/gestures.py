@@ -6,13 +6,17 @@ import winsound
 import threading
 import tkinter as tk
 
-# Seguridad de PyAutoGUI: si mueves el ratón a la esquina superior izquierda, se frena de emergencia
-#pyautogui.FAILSAFE = True
+# Desactivar el freno de emergencia al tocar las esquinas de la pantalla
+pyautogui.FAILSAFE = False
+pyautogui.PAUSE = 0.0
+
+# Mutex para proteger la sección crítica de las animaciones en Tkinter y evitar cierres por concurrencia
+lock_efecto_clic = threading.Lock()
 
 # Cargar clasificadores clásicos usando la ruta interna nativa de OpenCV
-face_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_frontalface_default.xml')
-eye_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_eye.xml')
-smile_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_smile.xml')
+face_cascade = cv2.CascadeClassifier('../haarcascades/haarcascade_frontalface_default.xml')
+eye_cascade = cv2.CascadeClassifier('../haarcascades/haarcascade_eye.xml')
+smile_cascade = cv2.CascadeClassifier('../haarcascades/haarcascade_smile.xml')
 
 # Variables de control para evitar clics múltiples descontrolados
 contador_ojo_izq = 0
@@ -40,26 +44,31 @@ def mostrar_efecto_clic(x, y, tipo="left"):
     """
     Reproduce un sonido de clic y muestra una animación de onda expansiva 
     transparente en las coordenadas exactas (x, y) de la pantalla.
+    Protegido con un Mutex para evitar crasheos por concurrencia en Tkinter.
     """
     # 1. Reproducir sonido de clic de forma asíncrona
     try:
         winsound.PlaySound('./SoundEffects/click.wav', winsound.SND_FILENAME | winsound.SND_ASYNC)
-    except Exception as e:
+    except Exception:
         pass  # Si falta el archivo de audio, el programa sigue funcionando
 
     # 2. Función interna para crear la animación de la onda expansiva
     def dibujar_circulo():
+        # Sección crítica: intromisión no bloqueante. Si ya hay una onda activa, descarta la duplicada
+        if not lock_efecto_clic.acquire(blocking=False):
+            return
+
         try:
             root = tk.Tk()
-            root.overrideredirect(True)  # Sin bordes ni barra de título
-            root.attributes('-topmost', True)  # Siempre visible por encima de otras ventanas
+            root.overrideredirect(True)        # Sin bordes ni barra de título
+            root.attributes('-topmost', True) # Siempre visible por encima de otras ventanas
             
             # Definir el color transparente (Croma Key)
             color_transparente = '#000001'
             root.config(bg=color_transparente)
             root.attributes('-transparentcolor', color_transparente)
             
-            # Tamaño de la ventana flotante (100x100 píxeles para dar espacio a la expansión)
+            # Tamaño de la ventana flotante (100x100 píxeles)
             tam = 100
             root.geometry(f"{tam}x{tam}+{int(x - tam/2)}+{int(y - tam/2)}")
             
@@ -87,7 +96,7 @@ def mostrar_efecto_clic(x, y, tipo="left"):
                         canvas.create_oval(cx - r2, cy - r2, cx + r2, cy + r2, outline=color_anillo, width=1)
                         
                     # Programar el siguiente fotograma en 18 milisegundos
-                    root.after(185 // max_steps, lambda: animar_onda(step + 1))
+                    root.after(18, lambda: animar_onda(step + 1))
                 else:
                     root.destroy()  # Cerrar la ventana al terminar la animación
 
@@ -96,16 +105,18 @@ def mostrar_efecto_clic(x, y, tipo="left"):
             root.mainloop()
         except Exception:
             pass
+        finally:
+            # Garantizar la liberación del Mutex al terminar la ventana o si ocurre una excepción
+            lock_efecto_clic.release()
 
-    # Lanzar el efecto visual en un hilo separado para que sea instantáneo y fluido
+    # Lanzar el efecto visual en un hilo separado
     threading.Thread(target=dibujar_circulo, daemon=True).start()
-
 
 
 def procesar_gestos(frame):
     """
     Procesa el frame usando visión clásica para detectar guiños
-    y ejecutar clics izquierdo y derecho con PyAutoGui.
+    y ejecutar clics izquierdo y derecho con PyAutoGUI.
     """
     global contador_ojo_izq, contador_ojo_der, contador_edge_scroll
     global contador_aperturas_boca, boca_estaba_abierta, frames_desde_ultima_apertura
@@ -123,7 +134,6 @@ def procesar_gestos(frame):
     for (x, y, w, h) in faces:
         # Dibujar rectángulo de la cara
         cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-
 
         # --- MOVIMIENTO DEL RATÓN BASADO EN EL CENTRO DE LA CARA/NARIZ (JOYSTICK) ---
         centro_x = x + w // 2
@@ -167,20 +177,18 @@ def procesar_gestos(frame):
             
             # Mover de forma absoluta a la posición controlada
             pyautogui.moveTo(nuevo_x, nuevo_y, duration=0.0)
-        # ----------------------------------------------------------------
-        
 
         # Región de interés (ROI) para los ojos (mitad superior de la cara)
         roi_gray = gray[y:y + int(h/2), x:x + w]
         roi_color = frame[y:y + int(h/2), x:x + w]
 
-        # Mejora: Ecualizar el histograma para mejorar el contraste lumínico
+        # Ecualizar el histograma para mejorar el contraste lumínico
         roi_gray = cv2.equalizeHist(roi_gray)
         
         # 2. Detección de Ojos
         eyes = eye_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=4)
         
-        # Ordenar los ojos detectados horizontalmente por su coordenada X (ex)
+        # Ordenar los ojos detectados horizontalmente por su coordenada X
         eyes = sorted(eyes, key=lambda e: e[0])
         
         # Lógica basada en el número de ojos detectados
@@ -192,8 +200,7 @@ def procesar_gestos(frame):
                 cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 255, 0), 2)
 
         elif len(eyes) == 0:
-            # Si no se ve ningún ojo (mirando hacia otro lado o parpadeo total), 
-            # reseteamos contadores para evitar clics accidentales por giros
+            # Si no se ve ningún ojo, reseteamos contadores para evitar clics accidentales
             contador_ojo_izq = 0
             contador_ojo_der = 0
             cv2.putText(frame, "Ojos no detectados", (50, 50), 
@@ -204,7 +211,7 @@ def procesar_gestos(frame):
             ex, ey, ew, eh = eyes[0]
             cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 255, 255), 2)
             
-            # Analizar en qué mitad de la cara está el ojo visible para saber cuál falta
+            # Analizar en qué mitad de la cara está el ojo visible
             centro_ojo_x = ex + ew / 2
             ancho_mitad_cara = w / 2
             
@@ -216,9 +223,8 @@ def procesar_gestos(frame):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
                 
                 if contador_ojo_der == UMBRAL_FRAMES:
-                    pyautogui.click(button='right')  # Clic derecho
+                    pyautogui.click(button='right')
                     
-                    # Obtener una posición actual del cursor para mostrar el efecto visual del clic derecho
                     rx, ry = pyautogui.position()
                     mostrar_efecto_clic(rx, ry, tipo="right")
                     
@@ -233,9 +239,8 @@ def procesar_gestos(frame):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
                 
                 if contador_ojo_izq == UMBRAL_FRAMES:
-                    pyautogui.click(button='left')   # Clic izquierdo
+                    pyautogui.click(button='left')
 
-                    # Obtener una posición actual del cursor para mostrar el efecto visual del clic izquierdo
                     lx, ly = pyautogui.position()
                     mostrar_efecto_clic(lx, ly, tipo="left")
 
@@ -243,42 +248,35 @@ def procesar_gestos(frame):
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                     contador_ojo_izq = 0
 
-
         # --- 3. SCROLL POR BORDES (EDGE SCROLLING) ---
-        # Obtener dimensiones de la pantalla y posición actual del cursor global
         screen_w, screen_h = pyautogui.size()
         mouse_x, mouse_y = pyautogui.position()
         
-        MARGEN_BORDE = 60  # Píxeles de tolerancia desde el borde superior/inferior
+        MARGEN_BORDE = 60
         
         if mouse_y < MARGEN_BORDE:
-            # El ratón está tocando el borde superior de la pantalla
             contador_edge_scroll += 1
             cv2.putText(frame, f"Cargando Scroll Arriba ({contador_edge_scroll}/{UMBRAL_EDGE_SCROLL})", (50, 130), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             
             if contador_edge_scroll >= UMBRAL_EDGE_SCROLL:
-                pyautogui.scroll(250)  # Positivo = Subir página
+                pyautogui.scroll(250)
                 cv2.putText(frame, "¡SCROLL ARRIBA EJECUTADO!", (50, 170), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                contador_edge_scroll = 0  # Reiniciar contador para permitir scroll continuo
+                contador_edge_scroll = 0
                 
         elif mouse_y > screen_h - MARGEN_BORDE:
-            # El ratón está tocando el borde inferior de la pantalla
             contador_edge_scroll += 1
             cv2.putText(frame, f"Cargando Scroll Abajo ({contador_edge_scroll}/{UMBRAL_EDGE_SCROLL})", (50, 130), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             
             if contador_edge_scroll >= UMBRAL_EDGE_SCROLL:
-                pyautogui.scroll(-250)  # Negativo = Bajar página
+                pyautogui.scroll(-250)
                 cv2.putText(frame, "¡SCROLL ABAJO EJECUTADO!", (50, 170), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                 contador_edge_scroll = 0
         else:
-            # Si el ratón está en el centro o zona segura, reseteamos el contador
             contador_edge_scroll = 0
-
-
 
         # --- 4. DETECCIÓN DE DOBLE APERTURA DE BOCA (LANZAR TECLADO DE WINDOWS) ---
         boca_y1 = y + int(h * 0.65)
@@ -287,7 +285,6 @@ def procesar_gestos(frame):
         boca_x2 = x + int(w * 0.75)
         
         roi_boca_gray = gray[boca_y1:boca_y2, boca_x1:boca_x2]
-        roi_boca_color = frame[boca_y1:boca_y2, boca_x1:boca_x2]
         
         roi_boca_gray = cv2.equalizeHist(roi_boca_gray)
         _, thresh_boca = cv2.threshold(roi_boca_gray, 30, 255, cv2.THRESH_BINARY_INV)
@@ -295,18 +292,14 @@ def procesar_gestos(frame):
         area_boca_abierta = cv2.countNonZero(thresh_boca)
         cv2.rectangle(frame, (boca_x1, boca_y1), (boca_x2, boca_y2), (0, 255, 255), 1)
         
-        # Control de la ventana de tiempo entre aperturas
         if contador_aperturas_boca > 0:
             frames_desde_ultima_apertura += 1
             if frames_desde_ultima_apertura > UMBRAL_VENTANA_DOBLE:
-                # Si pasa demasiado tiempo, se reinicia el contador de doble gesto
                 contador_aperturas_boca = 0
                 frames_desde_ultima_apertura = 0
 
-        # Determinar si la boca está abierta en este fotograma exacto
         boca_actualmente_abierta = (area_boca_abierta > MARCA_BOCA_ABIERTA)
         
-        # Detectar el "flanco de subida" (el momento exacto en que se abre la boca)
         if boca_actualmente_abierta and not boca_estaba_abierta:
             contador_aperturas_boca += 1
             frames_desde_ultima_apertura = 0
@@ -315,7 +308,6 @@ def procesar_gestos(frame):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
             if contador_aperturas_boca == 2:
-                # ¡Doble apertura confirmada! Lanzar el teclado nativo de Windows (OSK)
                 try:
                     os.system("start osk")
                 except Exception:
@@ -324,19 +316,13 @@ def procesar_gestos(frame):
                 cv2.putText(frame, "¡TECLADO DE WINDOWS ACTIVADO!", (50, 170), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
-                # Reiniciar contadores tras la acción
                 contador_aperturas_boca = 0
                 frames_desde_ultima_apertura = 0
                 
-        # Actualizar el estado anterior de la boca
         boca_estaba_abierta = boca_actualmente_abierta
 
-
-
         # --- 5. MODO EMOJI: ABRIR PANEL DE WINDOWS CON UNA SONRISA ---
-        # Analizar la mitad inferior de la cara para detectar la sonrisa
         roi_gray_cara_inferior = gray[y + int(h*0.5):y + h, x:x + w]
-        roi_color_cara_inferior = frame[y + int(h*0.5):y + h, x:x + w]
         
         smiles = smile_cascade.detectMultiScale(roi_gray_cara_inferior, scaleFactor=1.7, minNeighbors=22, minSize=(30, 30))
         
@@ -347,7 +333,6 @@ def procesar_gestos(frame):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
                 if contador_sonrisa >= UMBRAL_SONRISA_FRAMES:
-                    # ¡Sonrisa confirmada! Pulsar simultáneamente Windows + .
                     try:
                         pyautogui.hotkey('win', '.')
                     except Exception:
@@ -356,11 +341,9 @@ def procesar_gestos(frame):
                     cv2.putText(frame, "¡PANEL DE EMOJIS ACTIVADO!", (50, 250), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                     
-                    # Bloquear para que no se abra en bucle hasta que dejes de sonreír
                     emoji_bloqueado = True
                     contador_sonrisa = 0
         else:
-            # Si el usuario relaja la cara, reseteamos el bloqueo para futuras aperturas
             contador_sonrisa = 0
             emoji_bloqueado = False
 

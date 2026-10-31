@@ -19,6 +19,7 @@ def main():
             print("No es posible obtener la imagen")
             break
 
+
         # Procesar los gestos en el frame
         frame_procesado = procesar_gestos(frame)
 
