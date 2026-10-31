@@ -109,7 +109,7 @@ python main.py
 
 ```
 
-## 📁 Estructura del Proyecto
+## Estructura del Proyecto
 
 ```
 ├── main.py              # Bucle principal de captura y control de ventana
