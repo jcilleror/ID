@@ -1,4 +1,5 @@
 import os
+import platform
 import cv2
 import numpy as np
 import pyautogui
@@ -6,345 +7,435 @@ import winsound
 import threading
 import tkinter as tk
 
-# Desactivar el freno de emergencia al tocar las esquinas de la pantalla
+# ------------------------------------------
+# CONFIGURATION & SAFETY SETTINGS
+# ------------------------------------------
 pyautogui.FAILSAFE = False
 pyautogui.PAUSE = 0.0
 
-# Mutex para proteger la sección crítica de las animaciones en Tkinter y evitar cierres por concurrencia
-lock_efecto_clic = threading.Lock()
+# Mutex to protect critical sections in Tkinter animations and prevent concurrency crashes
+click_effect_lock = threading.Lock()
 
-# Cargar clasificadores clásicos usando la ruta interna nativa de OpenCV
-face_cascade = cv2.CascadeClassifier('../haarcascades/haarcascade_frontalface_default.xml')
-eye_cascade = cv2.CascadeClassifier('../haarcascades/haarcascade_eye.xml')
-smile_cascade = cv2.CascadeClassifier('../haarcascades/haarcascade_smile.xml')
+# Single and permanent Tkinter thread to avoid multithreading errors
+tk_root = None
+tk_ready = threading.Event()
 
-# Variables de control para evitar clics múltiples descontrolados
-contador_ojo_izq = 0
-contador_ojo_der = 0
-UMBRAL_FRAMES = 6  # Fotogramas consecutivos necesarios para confirmar el guiño
+def initialize_tkinter_loop():
+    global tk_root
+    try:
+        tk_root = tk.Tk()
+        tk_root.withdraw()  # Hide the main root window
+        tk_ready.set()
+        tk_root.mainloop()
+    except Exception:
+        pass
 
-# Variables de control para el scroll por bordes
-contador_edge_scroll = 0
-UMBRAL_EDGE_SCROLL = 20  # Fotogramas que se debe mantener el ratón en el borde para que salte el scroll
+# Start the Tkinter graphical engine in a dedicated background thread
+threading.Thread(target=initialize_tkinter_loop, daemon=True).start()
 
-# Variables de control para la doble apertura de boca (Teclado)
-contador_aperturas_boca = 0
-boca_estaba_abierta = False
-frames_desde_ultima_apertura = 0
-UMBRAL_VENTANA_DOBLE = 45  # Fotogramas máximos permitidos entre la 1ª y la 2ª apertura
-MARCA_BOCA_ABIERTA = 2200   # Umbral de píxeles oscuros para considerar la boca abierta
+# Load classical Haar Cascade classifiers for face, eye, and smile detection
+face_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_frontalface_default.xml')
+eye_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_eye.xml')
+smile_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_smile.xml')
 
-# Variables de control para el Modo Emoji (Sonrisa -> Panel Windows + .)
-contador_sonrisa = 0
-UMBRAL_SONRISA_FRAMES = 12  # Fotogramas consecutivos de sonrisa para confirmar
-emoji_bloqueado = False     # Mecanismo de un solo uso hasta relajar la cara
+# ------------------------------------------
+# CONTROL VARIABLES & THRESHOLDS
+# ------------------------------------------
+# Eye blink / click tracking variables
+left_eye_counter = 0
+right_eye_counter = 0
+FRAME_THRESHOLD = 6  # Consecutive frames required to confirm a wink
+
+# Edge scrolling control variables
+edge_scroll_counter = 0
+EDGE_SCROLL_THRESHOLD = 8  # Consecutive frames at the screen edge to trigger scroll
+
+# Double mouth opening control variables (Virtual Keyboard)
+mouth_opening_counter = 0
+mouth_was_open = False
+frames_since_last_opening = 0
+DOUBLE_OPEN_WINDOW_THRESHOLD = 45  # Max frames allowed between 1st and 2nd mouth opening
+
+# Emoji panel control variables (Sustained smile)
+smile_counter = 0
+SMILE_FRAME_THRESHOLD = 12  # Consecutive frames of smiling to confirm
+emoji_locked = False        # Single-use mechanism until face relaxes
+
+# System pause / sleep control variables (Sustained open mouth)
+system_paused = False
+sustained_open_mouth_counter = 0
+PAUSE_MOUTH_THRESHOLD = 60  # Consecutive frames with mouth open to toggle pause (~2 seconds)
+
+# Drag & Drop control variables (Sustained closed eyes)
+drag_active = False
+drag_closed_eyes_counter = 0
+DRAG_FRAME_THRESHOLD = 35  # Consecutive frames with eyes closed to toggle drag/drop (~1 second)
 
 
-def mostrar_efecto_clic(x, y, tipo="left"):
+# ------------------------------------------
+# GRAPHICAL FEEDBACK & UTILITIES
+# ------------------------------------------
+def show_click_effect(x, y, click_type="left"):
     """
-    Reproduce un sonido de clic y muestra una animación de onda expansiva 
-    transparente en las coordenadas exactas (x, y) de la pantalla.
-    Protegido con un Mutex para evitar crasheos por concurrencia en Tkinter.
+    Plays a click sound and displays a transparent expanding ripple animation 
+    at exact screen coordinates (x, y). Protected with a Mutex.
     """
-    # 1. Reproducir sonido de clic de forma asíncrona
     try:
         winsound.PlaySound('./SoundEffects/click.wav', winsound.SND_FILENAME | winsound.SND_ASYNC)
     except Exception:
-        pass  # Si falta el archivo de audio, el programa sigue funcionando
+        pass  
 
-    # 2. Función interna para crear la animación de la onda expansiva
-    def dibujar_circulo():
-        # Sección crítica: intromisión no bloqueante. Si ya hay una onda activa, descarta la duplicada
-        if not lock_efecto_clic.acquire(blocking=False):
+    if not tk_ready.is_set() or tk_root is None:
+        return
+
+    def create_overlay():
+        if not click_effect_lock.acquire(blocking=False):
             return
 
         try:
-            root = tk.Tk()
-            root.overrideredirect(True)        # Sin bordes ni barra de título
-            root.attributes('-topmost', True) # Siempre visible por encima de otras ventanas
+            top = tk.Toplevel(tk_root)
+            top.overrideredirect(True)        
+            top.attributes('-topmost', True) 
             
-            # Definir el color transparente (Croma Key)
-            color_transparente = '#000001'
-            root.config(bg=color_transparente)
-            root.attributes('-transparentcolor', color_transparente)
+            transparent_color = '#000001'
+            top.config(bg=transparent_color)
+            top.attributes('-transparentcolor', transparent_color)
             
-            # Tamaño de la ventana flotante (100x100 píxeles)
-            tam = 100
-            root.geometry(f"{tam}x{tam}+{int(x - tam/2)}+{int(y - tam/2)}")
+            size = 100
+            top.geometry(f"{size}x{size}+{int(x - size/2)}+{int(y - size/2)}")
             
-            canvas = tk.Canvas(root, width=tam, height=tam, highlightthickness=0, bg=color_transparente)
+            canvas = tk.Canvas(top, width=size, height=size, highlightthickness=0, bg=transparent_color)
             canvas.pack()
 
-            # Color del anillo (Cian para izquierdo, Naranja para derecho)
-            color_anillo = "#00E5FF" if tipo == "left" else "#FF6D00"
-            cx, cy = tam // 2, tam // 2
+            ring_color = "#00E5FF" if click_type == "left" else "#FF6D00"
+            cx, cy = size // 2, size // 2
 
-            # Función recursiva para animar el crecimiento de las ondas
-            def animar_onda(step=0):
-                max_steps = 10  # Número total de fotogramas de la animación
+            def animate_ripple(step=0):
+                max_steps = 10  
                 if step < max_steps:
-                    canvas.delete("all")  # Limpiar el fotograma anterior
-                    
-                    # Radio de la onda principal (crece en cada paso)
+                    canvas.delete("all")  
                     r1 = 4 + step * 3.5
-                    grosor = max(1, int(3 - step * 0.15))
-                    canvas.create_oval(cx - r1, cy - r1, cx + r1, cy + r1, outline=color_anillo, width=grosor)
+                    thickness = max(1, int(3 - step * 0.15))
+                    canvas.create_oval(cx - r1, cy - r1, cx + r1, cy + r1, outline=ring_color, width=thickness)
                     
-                    # Segunda onda desfasada para dar efecto de ondas múltiples
                     if step >= 3:
                         r2 = 4 + (step - 3) * 3.5
-                        canvas.create_oval(cx - r2, cy - r2, cx + r2, cy + r2, outline=color_anillo, width=1)
+                        canvas.create_oval(cx - r2, cy - r2, cx + r2, cy + r2, outline=ring_color, width=1)
                         
-                    # Programar el siguiente fotograma en 18 milisegundos
-                    root.after(18, lambda: animar_onda(step + 1))
+                    top.after(18, lambda: animate_ripple(step + 1))
                 else:
-                    root.destroy()  # Cerrar la ventana al terminar la animación
+                    top.destroy()
+                    click_effect_lock.release()
 
-            # Iniciar la animación
-            animar_onda(0)
-            root.mainloop()
+            animate_ripple(0)
         except Exception:
-            pass
-        finally:
-            # Garantizar la liberación del Mutex al terminar la ventana o si ocurre una excepción
-            lock_efecto_clic.release()
+            click_effect_lock.release()
 
-    # Lanzar el efecto visual en un hilo separado
-    threading.Thread(target=dibujar_circulo, daemon=True).start()
+    tk_root.after(0, create_overlay)
 
 
+# -----------------------------------------
+# MAIN GESTURE PROCESSING PIPELINE
+# -----------------------------------------
 def procesar_gestos(frame):
     """
-    Procesa el frame usando visión clásica para detectar guiños
-    y ejecutar clics izquierdo y derecho con PyAutoGUI.
+    Processes the webcam frame using classical computer vision to handle face tracking,
+    mouse movement, clicks, edge scrolling, virtual keyboard, emojis, pause, and drag-and-drop.
     """
-    global contador_ojo_izq, contador_ojo_der, contador_edge_scroll
-    global contador_aperturas_boca, boca_estaba_abierta, frames_desde_ultima_apertura
-    global contador_sonrisa, emoji_bloqueado
+    if frame is None or frame.size == 0:
+        return frame
 
-    # Aplicar efecto espejo para corregir la inversión de la cámara
+    global left_eye_counter, right_eye_counter, edge_scroll_counter
+    global mouth_opening_counter, mouth_was_open, frames_since_last_opening
+    global smile_counter, emoji_locked
+    global system_paused, sustained_open_mouth_counter
+    global drag_active, drag_closed_eyes_counter
+
+    # Apply mirror effect to correct camera inversion
     frame = cv2.flip(frame, 1)
     h_frame, w_frame, _ = frame.shape
     
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     
-    # 1. Detección de Rostro (Clásico Haar Cascade)
+    # ------------------------------------------
+    # 1. PRIMARY FACE DETECTION & MOUTH ANALYSIS
+    # ------------------------------------------
     faces = face_cascade.detectMultiScale(gray, scaleFactor=1.3, minNeighbors=5)
     
-    for (x, y, w, h) in faces:
-        # Dibujar rectángulo de la cara
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+    if len(faces) == 0:
+        return frame
 
-        # --- MOVIMIENTO DEL RATÓN BASADO EN EL CENTRO DE LA CARA/NARIZ (JOYSTICK) ---
-        centro_x = x + w // 2
-        centro_y = y + h // 2
-        
-        # Centro de la pantalla de la cámara (punto neutro)
-        centro_frame_x = w_frame // 2
-        centro_frame_y = h_frame // 2
-        
-        # Calcular la distancia (desplazamiento) respecto al centro neutro
-        desplazamiento_x = centro_x - centro_frame_x
-        desplazamiento_y = centro_y - centro_frame_y
-        
-        # Zonas muertas (Deadzone): Si el movimiento es muy pequeño, ignorarlo
-        ZONA_MUERTA_X = 25
-        ZONA_MUERTA_Y = 10 
-        
-        vel_x = 0
-        vel_y = 0
-        
-        if abs(desplazamiento_x) > ZONA_MUERTA_X:
-            vel_x = int((desplazamiento_x - np.sign(desplazamiento_x) * ZONA_MUERTA_X) * 1.25)
-            
-        if abs(desplazamiento_y) > ZONA_MUERTA_Y:
-            vel_y = int((desplazamiento_y - np.sign(desplazamiento_y) * ZONA_MUERTA_Y) * 1.25)
-            
-        # Mover el ratón asegurando que nunca se salga de los límites de la pantalla
-        if vel_x != 0 or vel_y != 0:
-            screen_w, screen_h = pyautogui.size()
-            curr_x, curr_y = pyautogui.position()
-            
-            # Margen de seguridad para que el ratón nunca llegue a 0 ni al máximo exacto
-            MARGEN_LIMITE = 10
-            
-            nuevo_x = curr_x + vel_x
-            nuevo_y = curr_y + vel_y
-            
-            # Restringir (Clamp) los valores para que no puedan salir del área segura de la pantalla
-            nuevo_x = max(MARGEN_LIMITE, min(screen_w - MARGEN_LIMITE, nuevo_x))
-            nuevo_y = max(MARGEN_LIMITE, min(screen_h - MARGEN_LIMITE, nuevo_y))
-            
-            # Mover de forma absoluta a la posición controlada
-            pyautogui.moveTo(nuevo_x, nuevo_y, duration=0.0)
+    # Select ONLY the primary face (the largest one by area, meaning closest to the camera)
+    # This prevents any interference if another person or object appears in the background.
+    primary_face = max(faces, key=lambda f: f[2] * f[3])
+    x, y, w, h = primary_face
 
-        # Región de interés (ROI) para los ojos (mitad superior de la cara)
-        roi_gray = gray[y:y + int(h/2), x:x + w]
-        roi_color = frame[y:y + int(h/2), x:x + w]
-
-        # Ecualizar el histograma para mejorar el contraste lumínico
-        roi_gray = cv2.equalizeHist(roi_gray)
+    # Dynamic face bounding box color (Red = Paused, Orange = Dragging, Blue = Normal)
+    if system_paused:
+        face_box_color = (0, 0, 255)
+    elif drag_active:
+        face_box_color = (0, 165, 255)
+    else:
+        face_box_color = (255, 0, 0)
         
-        # 2. Detección de Ojos
-        eyes = eye_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=4)
-        
-        # Ordenar los ojos detectados horizontalmente por su coordenada X
-        eyes = sorted(eyes, key=lambda e: e[0])
-        
-        # Lógica basada en el número de ojos detectados
-        if len(eyes) >= 2:
-            # Si se detectan 2 ojos, se reinician los contadores (ojos abiertos)
-            contador_ojo_izq = 0
-            contador_ojo_der = 0
-            for (ex, ey, ew, eh) in eyes:
-                cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 255, 0), 2)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), face_box_color, 2)
 
-        elif len(eyes) == 0:
-            # Si no se ve ningún ojo, reseteamos contadores para evitar clics accidentales
-            contador_ojo_izq = 0
-            contador_ojo_der = 0
-            cv2.putText(frame, "Ojos no detectados", (50, 50), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (128, 128, 128), 2)
+    # Region of Interest (ROI) for eyes within the primary face
+    roi_gray = gray[y:y + int(h/2), x:x + w]
+    roi_color = frame[y:y + int(h/2), x:x + w]
+    roi_gray = cv2.equalizeHist(roi_gray)
+    
+    eyes = eye_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=4)
 
-        elif len(eyes) == 1:
-            # Solo se detecta un ojo, el otro está cerrado (potencial guiño)
-            ex, ey, ew, eh = eyes[0]
-            cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 255, 255), 2)
+    # --- Robust mouth contour & cavity analysis ---
+    mouth_y1 = y + int(h * 0.68)
+    mouth_y2 = y + int(h * 0.93)
+    mouth_x1 = x + int(w * 0.28)
+    mouth_x2 = x + int(w * 0.72)
+    
+    roi_mouth_gray = gray[mouth_y1:mouth_y2, mouth_x1:mouth_x2]
+    cv2.rectangle(frame, (mouth_x1, mouth_y1), (mouth_x2, mouth_y2), (0, 255, 255), 1)
+
+    mouth_currently_open = False
+
+    if roi_mouth_gray.shape[0] > 10 and roi_mouth_gray.shape[1] > 10:
+        blur_mouth = cv2.GaussianBlur(roi_mouth_gray, (5, 5), 0)
+        _, thresh_mouth = cv2.threshold(blur_mouth, 45, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(thresh_mouth, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        max_cavity_height = 0
+        for c in contours:
+            if cv2.contourArea(c) > 40:
+                _, _, _, contour_h = cv2.boundingRect(c)
+                if contour_h > max_cavity_height:
+                    max_cavity_height = contour_h
+        
+        opening_ratio = max_cavity_height / float(h)
+        mouth_currently_open = (opening_ratio > 0.08)
+
+    # --- Pause / Sleep Mode (Sustained open mouth) ---
+    if mouth_currently_open:
+        sustained_open_mouth_counter += 1
+        cv2.putText(frame, f"Loading Pause ({sustained_open_mouth_counter}/{PAUSE_MOUTH_THRESHOLD})", (50, 170), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+        
+        if sustained_open_mouth_counter >= PAUSE_MOUTH_THRESHOLD:
+            system_paused = not system_paused
+            sustained_open_mouth_counter = 0
+            if system_paused and drag_active:
+                try:
+                    pyautogui.mouseUp(button='left')
+                except Exception:
+                    pass
+                drag_active = False
+            try:
+                winsound.Beep(800 if system_paused else 1200, 200)
+            except Exception:
+                pass
+    else:
+        sustained_open_mouth_counter = 0
+
+    # --- Skip all actions if system is paused ---
+    if system_paused:
+        cv2.putText(frame, "--- SYSTEM PAUSED ---", (50, 90), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(frame, "Keep mouth open to reactivate", (50, 130), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        return frame
+
+    # ------------------------------------------
+    # 2. FACIAL JOYSTICK (MOUSE MOVEMENT)
+    # ------------------------------------------
+    face_center_x = x + w // 2
+    face_center_y = y + h // 2
+    
+    frame_center_x = w_frame // 2
+    frame_center_y = h_frame // 2
+    
+    offset_x = face_center_x - frame_center_x
+    offset_y = face_center_y - frame_center_y
+    
+    DEADZONE_X = 25
+    DEADZONE_Y = 10 
+    
+    cursor_vel_x = 0
+    cursor_vel_y = 0
+    
+    if abs(offset_x) > DEADZONE_X:
+        cursor_vel_x = int((offset_x - np.sign(offset_x) * DEADZONE_X) * 0.6)
+        
+    if abs(offset_y) > DEADZONE_Y:
+        cursor_vel_y = int((offset_y - np.sign(offset_y) * DEADZONE_Y) * 0.6)
+        
+    if cursor_vel_x != 0 or cursor_vel_y != 0:
+        screen_width, screen_height = pyautogui.size()
+        curr_x, curr_y = pyautogui.position()
+        
+        SAFE_MARGIN = 10
+        target_x = curr_x + cursor_vel_x
+        target_y = curr_y + cursor_vel_y
+        
+        target_x = max(SAFE_MARGIN, min(screen_width - SAFE_MARGIN, target_x))
+        target_y = max(SAFE_MARGIN, min(screen_height - SAFE_MARGIN, target_y))
+        
+        pyautogui.moveTo(target_x, target_y, duration=0.0)
+
+    # ------------------------------------------
+    # 3. EYES DETECTION, WINKS & DRAG AND DROP
+    # ------------------------------------------
+    eyes = sorted(eyes, key=lambda e: e[0])
+    
+    if len(eyes) == 0:
+        # No eyes visible (Sustained closed eyes -> Drag & Drop)
+        left_eye_counter = 0
+        right_eye_counter = 0
+        
+        drag_closed_eyes_counter += 1
+        drag_state_text = "Dropping..." if drag_active else "Grabbing..."
+        cv2.putText(frame, f"Drag & Drop [{drag_state_text}] ({drag_closed_eyes_counter}/{DRAG_FRAME_THRESHOLD})", (50, 50), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+        
+        if drag_closed_eyes_counter >= DRAG_FRAME_THRESHOLD:
+            drag_active = not drag_active
+            try:
+                if drag_active:
+                    pyautogui.mouseDown(button='left')
+                    winsound.Beep(1000, 150)
+                else:
+                    pyautogui.mouseUp(button='left')
+                    winsound.Beep(600, 150)
+            except Exception:
+                pass
+            drag_closed_eyes_counter = 0
             
-            # Analizar en qué mitad de la cara está el ojo visible
-            centro_ojo_x = ex + ew / 2
-            ancho_mitad_cara = w / 2
+    else:
+        drag_closed_eyes_counter = 0
+
+        # IF DRAG MODE IS ACTIVE, BLOCK ALL OTHER ACTIONS (CLICKS, KEYBOARD, EMOJIS, SCROLL)
+        if drag_active:
+            cv2.putText(frame, "--- DRAG MODE ACTIVE ---", (50, 50), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+            mouth_was_open = mouth_currently_open
+            return frame
+
+        # --- Virtual Keyboard Trigger (Double mouth opening) ---
+        if mouth_opening_counter > 0:
+            frames_since_last_opening += 1
+            if frames_since_last_opening > DOUBLE_OPEN_WINDOW_THRESHOLD:
+                mouth_opening_counter = 0
+                frames_since_last_opening = 0
+
+        if mouth_currently_open and not mouth_was_open:
+            mouth_opening_counter += 1
+            frames_since_last_opening = 0
             
-            if centro_ojo_x < ancho_mitad_cara:
-                # Falta el ojo derecho (desde la perspectiva de la cámara)
-                contador_ojo_der += 1
-                contador_ojo_izq = 0
-                cv2.putText(frame, f"Guiño Derecho ({contador_ojo_der})", (50, 50), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                
-                if contador_ojo_der == UMBRAL_FRAMES:
-                    pyautogui.click(button='right')
-                    
-                    rx, ry = pyautogui.position()
-                    mostrar_efecto_clic(rx, ry, tipo="right")
-                    
-                    cv2.putText(frame, "¡CLICK DERECHO EJECUTADO!", (50, 90), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                    contador_ojo_der = 0
-            else:
-                # Falta el ojo izquierdo
-                contador_ojo_izq += 1
-                contador_ojo_der = 0
-                cv2.putText(frame, f"Guiño Izquierdo ({contador_ojo_izq})", (50, 50), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-                
-                if contador_ojo_izq == UMBRAL_FRAMES:
-                    pyautogui.click(button='left')
-
-                    lx, ly = pyautogui.position()
-                    mostrar_efecto_clic(lx, ly, tipo="left")
-
-                    cv2.putText(frame, "¡CLICK IZQUIERDO EJECUTADO!", (50, 90), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    contador_ojo_izq = 0
-
-        # --- 3. SCROLL POR BORDES (EDGE SCROLLING) ---
-        screen_w, screen_h = pyautogui.size()
-        mouse_x, mouse_y = pyautogui.position()
-        
-        MARGEN_BORDE = 60
-        
-        if mouse_y < MARGEN_BORDE:
-            contador_edge_scroll += 1
-            cv2.putText(frame, f"Cargando Scroll Arriba ({contador_edge_scroll}/{UMBRAL_EDGE_SCROLL})", (50, 130), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            
-            if contador_edge_scroll >= UMBRAL_EDGE_SCROLL:
-                pyautogui.scroll(250)
-                cv2.putText(frame, "¡SCROLL ARRIBA EJECUTADO!", (50, 170), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                contador_edge_scroll = 0
-                
-        elif mouse_y > screen_h - MARGEN_BORDE:
-            contador_edge_scroll += 1
-            cv2.putText(frame, f"Cargando Scroll Abajo ({contador_edge_scroll}/{UMBRAL_EDGE_SCROLL})", (50, 130), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            
-            if contador_edge_scroll >= UMBRAL_EDGE_SCROLL:
-                pyautogui.scroll(-250)
-                cv2.putText(frame, "¡SCROLL ABAJO EJECUTADO!", (50, 170), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                contador_edge_scroll = 0
-        else:
-            contador_edge_scroll = 0
-
-        # --- 4. DETECCIÓN DE DOBLE APERTURA DE BOCA (LANZAR TECLADO DE WINDOWS) ---
-        boca_y1 = y + int(h * 0.65)
-        boca_y2 = y + h
-        boca_x1 = x + int(w * 0.25)
-        boca_x2 = x + int(w * 0.75)
-        
-        roi_boca_gray = gray[boca_y1:boca_y2, boca_x1:boca_x2]
-        
-        roi_boca_gray = cv2.equalizeHist(roi_boca_gray)
-        _, thresh_boca = cv2.threshold(roi_boca_gray, 30, 255, cv2.THRESH_BINARY_INV)
-        
-        area_boca_abierta = cv2.countNonZero(thresh_boca)
-        cv2.rectangle(frame, (boca_x1, boca_y1), (boca_x2, boca_y2), (0, 255, 255), 1)
-        
-        if contador_aperturas_boca > 0:
-            frames_desde_ultima_apertura += 1
-            if frames_desde_ultima_apertura > UMBRAL_VENTANA_DOBLE:
-                contador_aperturas_boca = 0
-                frames_desde_ultima_apertura = 0
-
-        boca_actualmente_abierta = (area_boca_abierta > MARCA_BOCA_ABIERTA)
-        
-        if boca_actualmente_abierta and not boca_estaba_abierta:
-            contador_aperturas_boca += 1
-            frames_desde_ultima_apertura = 0
-            
-            cv2.putText(frame, f"Gesto Boca ({contador_aperturas_boca}/2)", (50, 130), 
+            cv2.putText(frame, f"Mouth Gesture ({mouth_opening_counter}/2)", (50, 130), 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
-            if contador_aperturas_boca == 2:
+            if mouth_opening_counter == 2:
                 try:
-                    os.system("start osk")
+                    os_name = platform.system()
+                    if os_name == 'Windows':
+                        os.system("start osk")
+                    elif os_name == 'Darwin':
+                        os.system("open /System/Library/CoreServices/Applications/Accessibility\\ Keyboard.app")
                 except Exception:
                     pass
                 
-                cv2.putText(frame, "¡TECLADO DE WINDOWS ACTIVADO!", (50, 170), 
+                cv2.putText(frame, "--- VIRTUAL KEYBOARD ACTIVATED ---", (50, 170), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 
-                contador_aperturas_boca = 0
-                frames_desde_ultima_apertura = 0
+                mouth_opening_counter = 0
+                frames_since_last_opening = 0
                 
-        boca_estaba_abierta = boca_actualmente_abierta
+        mouth_was_open = mouth_currently_open
 
-        # --- 5. MODO EMOJI: ABRIR PANEL DE WINDOWS CON UNA SONRISA ---
-        roi_gray_cara_inferior = gray[y + int(h*0.5):y + h, x:x + w]
+        # --- Eye Winks (Left / Right Clicks) ---
+        if len(eyes) >= 2:
+            left_eye_counter = 0
+            right_eye_counter = 0
+            for (ex, ey, ew, eh) in eyes:
+                cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 255, 0), 2)
+
+        elif len(eyes) == 1:
+            ex, ey, ew, eh = eyes[0]
+            cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 255, 255), 2)
+            
+            eye_center_x = ex + ew / 2
+            half_face_width = w / 2
+            
+            if eye_center_x < half_face_width:
+                right_eye_counter += 1
+                left_eye_counter = 0
+                cv2.putText(frame, f"Right Click ({right_eye_counter})", (50, 50), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
+                
+                if right_eye_counter == FRAME_THRESHOLD:
+                    pyautogui.click(button='right')
+                    rx, ry = pyautogui.position()
+                    show_click_effect(rx, ry, click_type="right")
+                    right_eye_counter = 0
+            else:
+                left_eye_counter += 1
+                right_eye_counter = 0
+                cv2.putText(frame, f"Left Click ({left_eye_counter})", (50, 50), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                
+                if left_eye_counter == FRAME_THRESHOLD:
+                    pyautogui.click(button='left')
+                    lx, ly = pyautogui.position()
+                    show_click_effect(lx, ly, click_type="left")
+                    left_eye_counter = 0
+
+        # ------------------------------------------
+        # 4. EDGE SCROLLING
+        # ------------------------------------------
+        screen_width, screen_height = pyautogui.size()
+        mouse_x, mouse_y = pyautogui.position()
+        BORDER_MARGIN = 60
         
-        smiles = smile_cascade.detectMultiScale(roi_gray_cara_inferior, scaleFactor=1.7, minNeighbors=22, minSize=(30, 30))
+        if mouse_y < BORDER_MARGIN:
+            edge_scroll_counter += 1
+            cv2.putText(frame, f"Loading Scroll Up ({edge_scroll_counter}/{EDGE_SCROLL_THRESHOLD})", (50, 130), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            if edge_scroll_counter >= EDGE_SCROLL_THRESHOLD:
+                pyautogui.scroll(500)
+                edge_scroll_counter = 4
+        elif mouse_y > screen_height - BORDER_MARGIN:
+            edge_scroll_counter += 1
+            cv2.putText(frame, f"Loading Scroll Down ({edge_scroll_counter}/{EDGE_SCROLL_THRESHOLD})", (50, 130), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            if edge_scroll_counter >= EDGE_SCROLL_THRESHOLD:
+                pyautogui.scroll(-500)
+                edge_scroll_counter = 4
+        else:
+            edge_scroll_counter = 0
+
+        # ------------------------------------------
+        # 5. EMOJI PANEL (SUSTAINED SMILE)
+        # ------------------------------------------
+        lower_face_roi = gray[y + int(h*0.5):y + h, x:x + w]
+        smiles = smile_cascade.detectMultiScale(lower_face_roi, scaleFactor=1.7, minNeighbors=22, minSize=(30, 30))
         
         if len(smiles) > 0:
-            if not emoji_bloqueado:
-                contador_sonrisa += 1
-                cv2.putText(frame, f"Cargando Panel Emojis ({contador_sonrisa}/{UMBRAL_SONRISA_FRAMES})", (50, 210), 
+            if not emoji_locked:
+                smile_counter += 1
+                cv2.putText(frame, f"Loading Emoji Panel ({smile_counter}/{SMILE_FRAME_THRESHOLD})", (50, 210), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                 
-                if contador_sonrisa >= UMBRAL_SONRISA_FRAMES:
+                if smile_counter >= SMILE_FRAME_THRESHOLD:
                     try:
-                        pyautogui.hotkey('win', '.')
+                        os_name = platform.system()
+                        if os_name == 'Windows':
+                            pyautogui.hotkey('win', '.')
+                        elif os_name == 'Darwin':
+                            pyautogui.hotkey('ctrl', 'command', 'space')
                     except Exception:
                         pass
-                    
-                    cv2.putText(frame, "¡PANEL DE EMOJIS ACTIVADO!", (50, 250), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-                    
-                    emoji_bloqueado = True
-                    contador_sonrisa = 0
+                    emoji_locked = True
+                    smile_counter = 0
         else:
-            contador_sonrisa = 0
-            emoji_bloqueado = False
+            smile_counter = 0
+            emoji_locked = False
 
     return frame
