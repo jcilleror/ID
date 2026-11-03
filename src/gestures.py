@@ -58,7 +58,7 @@ DOUBLE_OPEN_WINDOW_THRESHOLD = 45  # Max frames allowed between 1st and 2nd mout
 
 # Emoji panel control variables (Sustained smile)
 smile_counter = 0
-SMILE_FRAME_THRESHOLD = 12  # Consecutive frames of smiling to confirm
+SMILE_FRAME_THRESHOLD = 25  # Consecutive frames of smiling to confirm
 emoji_locked = False        # Single-use mechanism until face relaxes
 
 # System pause / sleep control variables (Sustained open mouth)
@@ -414,8 +414,15 @@ def procesar_gestos(frame):
         # ------------------------------------------
         # 5. EMOJI PANEL (SUSTAINED SMILE)
         # ------------------------------------------
-        lower_face_roi = gray[y + int(h*0.5):y + h, x:x + w]
-        smiles = smile_cascade.detectMultiScale(lower_face_roi, scaleFactor=1.7, minNeighbors=22, minSize=(30, 30))
+        smile_y1 = y + int(h * 0.60)
+        smile_y2 = y + int(h * 0.90)
+        smile_x1 = x + int(w * 0.20)
+        smile_x2 = x + int(w * 0.80)
+        
+        lower_face_roi = gray[smile_y1:smile_y2, smile_x1:smile_x2]
+        # lower_face_roi = gray[y + int(h*0.5):y + h, x:x + w]
+
+        smiles = smile_cascade.detectMultiScale(lower_face_roi, scaleFactor=1.1, minNeighbors=45, minSize=(45, 15))
         
         if len(smiles) > 0:
             if not emoji_locked:
