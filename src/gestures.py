@@ -45,6 +45,8 @@ smile_cascade = cv2.CascadeClassifier('./haarcascades/haarcascade_smile.xml')
 left_eye_counter = 0
 right_eye_counter = 0
 FRAME_THRESHOLD = 6  # Consecutive frames required to confirm a wink
+ojo_izq_bloqueado = False
+ojo_der_bloqueado = False
 
 # Edge scrolling control variables
 edge_scroll_counter = 0
@@ -69,7 +71,7 @@ PAUSE_MOUTH_THRESHOLD = 60  # Consecutive frames with mouth open to toggle pause
 # Drag & Drop control variables (Sustained closed eyes)
 drag_active = False
 drag_closed_eyes_counter = 0
-DRAG_FRAME_THRESHOLD = 35  # Consecutive frames with eyes closed to toggle drag/drop (~1 second)
+DRAG_FRAME_THRESHOLD = 60  # Consecutive frames with eyes closed to toggle drag/drop (~1 second)
 
 
 # ------------------------------------------
@@ -354,6 +356,8 @@ def procesar_gestos(frame):
         if len(eyes) >= 2:
             left_eye_counter = 0
             right_eye_counter = 0
+            ojo_izq_bloqueado = False
+            ojo_der_bloqueado = False
             for (ex, ey, ew, eh) in eyes:
                 cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 255, 0), 2)
 
@@ -375,6 +379,7 @@ def procesar_gestos(frame):
                     rx, ry = pyautogui.position()
                     show_click_effect(rx, ry, click_type="right")
                     right_eye_counter = 0
+                    ojo_der_bloqueado = True
             else:
                 left_eye_counter += 1
                 right_eye_counter = 0
@@ -386,7 +391,7 @@ def procesar_gestos(frame):
                     lx, ly = pyautogui.position()
                     show_click_effect(lx, ly, click_type="left")
                     left_eye_counter = 0
-
+                    ojo_izq_bloqueado = True
         # ------------------------------------------
         # 4. EDGE SCROLLING
         # ------------------------------------------
